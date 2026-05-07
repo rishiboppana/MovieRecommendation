@@ -229,7 +229,7 @@ def main(args):
         with mlflow.start_run(run_name=f"als-r{params['rank']}-reg{params['reg_param']}") as run:
             mlflow.log_params(params)
             mlflow.log_param("spark_version", spark.version)
-            mlflow.log_param("dataset", "MovieLens-25M + Amazon-7.4M")
+            mlflow.log_param("dataset", "MovieLens-25M")
             mlflow.log_param("mode", "implicit" if params.get("implicit") else "explicit")
 
             mlflow.log_metrics({
