@@ -1,5 +1,5 @@
 # Core Spark (matches local /opt/spark 3.5.8)
-pyspark==3.5.3
+pyspark>=3.5.3
 
 # ML & experiment tracking
 mlflow==2.13.0

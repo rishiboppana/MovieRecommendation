@@ -17,7 +17,7 @@ import math
 import re
 import sqlite3
 import difflib
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -223,7 +223,7 @@ def save_review(
             username   = excluded.username,
             created_at = excluded.created_at
     """, (user_id, movie_id, rating, review or None, username or None,
-          datetime.utcnow().isoformat()))
+          datetime.now(timezone.utc).isoformat()))
     conn.commit()
     conn.close()
 
@@ -590,7 +590,7 @@ async def rate(req: RatingRequest, background_tasks: BackgroundTasks):
         "movie_id": req.movie_id,
         "event_type": "rate",
         "rating": req.rating,
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
     save_review(req.user_id, req.movie_id, req.rating, req.review, req.username)

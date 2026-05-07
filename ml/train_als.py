@@ -34,7 +34,7 @@ load_dotenv()
 
 ROOT = Path(__file__).parent.parent
 DATA_DIR = ROOT / "data" / "processed"
-MLFLOW_URI = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
+MLFLOW_URI = os.getenv("MLFLOW_TRACKING_URI", f"file://{ROOT}/mlflow/mlruns")
 EXPERIMENT_NAME = "movie-recommendations-als"
 MODEL_NAME = "movie-rec-als"
 
@@ -237,6 +237,7 @@ def main(args):
 
     # ── Also save model locally as backup ──
     local_model_path = str(ROOT / "mlflow" / "artifacts" / "als-model-local")
+    Path(local_model_path).parent.mkdir(parents=True, exist_ok=True)
     model.save(local_model_path)
     print(f"  Model saved locally: {local_model_path}")
 
@@ -298,7 +299,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--rank",      type=int,   default=150)
+    parser.add_argument("--rank",      type=int,   default=100)
     parser.add_argument("--reg-param", type=float, default=0.01)
     parser.add_argument("--max-iter",  type=int,   default=15)
     parser.add_argument("--alpha",     type=float, default=25.0)

@@ -3,6 +3,7 @@ CineRec — Netflix-style Movie Recommendation UI
 Model: Spark MLlib ALS trained on 25M ratings (MovieLens 25M dataset)
 """
 import os
+import html
 import sqlite3
 import requests
 import pandas as pd
@@ -490,8 +491,8 @@ def _genre_stats(movies: pd.DataFrame) -> pd.DataFrame:
 # ─────────────────────────── Card renderer ────────────────────
 def render_card(col, movie: dict, key_prefix: str):
     mid    = int(movie.get("movie_id") or 0)
-    title  = str(movie.get("title") or f"Movie {mid}")
-    genres = str(movie.get("genres") or "")
+    title  = html.escape(str(movie.get("title") or f"Movie {mid}"))
+    genres = html.escape(str(movie.get("genres") or ""))
     poster = movie.get("poster_url")
     _uid   = st.session_state.user_id
     _liked = st.session_state.all_liked_movies.setdefault(_uid, {})
@@ -898,14 +899,21 @@ else:
 
         if hero:
             hero_mid = int(hero.get("movie_id") or 0)
-            ov = hero.get("overview") or "A critically acclaimed film you will love."
+            ov = html.escape(hero.get("overview") or "A critically acclaimed film you will love.")
+            hero_title = html.escape(hero.get('title', ''))
+            hero_meta = html.escape(hero.get('genres', '')[:55])
+            poster = hero.get("poster_url")
+            if poster:
+                hero_img = f'<img class="hero-img" src="{html.escape(poster)}" alt="">'
+            else:
+                hero_img = '<div class="hero-img" style="background:#1a1a1a;width:100%;height:100%"></div>'
             st.markdown(f"""
             <div class="hero-wrap">
-              <img class="hero-img" src="{hero['poster_url']}" alt="">
+              {hero_img}
               <div class="hero-grad"></div>
               <div class="hero-body">
-                <div class="hero-title">{hero.get('title','')}</div>
-                <div class="hero-meta">{hero.get('genres','')[:55]}</div>
+                <div class="hero-title">{hero_title}</div>
+                <div class="hero-meta">{hero_meta}</div>
                 <div class="hero-desc">{ov[:220]}</div>
               </div>
             </div>""", unsafe_allow_html=True)

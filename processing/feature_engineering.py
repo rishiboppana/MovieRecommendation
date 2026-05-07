@@ -78,7 +78,7 @@ def compute_biases(ratings_df):
     return adjusted, global_mean, user_bias, item_bias
 
 
-def build_implicit_confidence(ratings_df, alpha: float = 40.0):
+def build_implicit_confidence(ratings_df, alpha: float = 25.0):
     """
     ALS implicit feedback: confidence c_ui = 1 + alpha * r_ui
     Used when treating ratings as implicit preference strength.

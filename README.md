@@ -181,8 +181,8 @@ The raw MovieLens data has titles and pipe-separated genre strings but no poster
 To replicate enrichment:
 ```bash
 export TMDB_API_KEY=your_key_here
-python3 data/tmdb_enrichment.py --limit 500   # quick demo: top 500 movies
 python3 data/tmdb_enrichment.py               # full: all 62K movies (~1 hour)
+python3 data/tmdb_enrichment.py --limit 500   # quick test: 500 movies only
 ```
 
 ### 2.4 Data Volume Summary
@@ -949,8 +949,8 @@ http://localhost:5001          MLflow experiment tracker
 
 make setup        # pip install + mkdir data directories
 make download     # wget MovieLens 25M (~650 MB)
+make enrich       # TMDB poster enrichment (run BEFORE etl)
 make etl          # Spark ETL: ~8 min, outputs gold ratings + feature tables
-# (optional) python3 data/tmdb_enrichment.py --limit 500
 make train        # Spark MLlib ALS: ~12 min, outputs model + recs parquet
 make precompute   # redis_precompute.py: ~30 sec, pushes 219K keys to Redis
 make api-dev      # start FastAPI on port 8000
@@ -1136,33 +1136,37 @@ This emergent semantic structure validates that the 100-dimensional ALS latent s
 
 | Tool | Version | Install |
 |---|---|---|
-| Python | 3.11+ | python.org |
-| Apache Spark | 3.5.x | `/opt/spark` |
-| Docker Desktop | 27+ | docker.com |
-| Redis | 7+ | `brew install redis` |
-| TMDB API key | — | themoviedb.org/settings/api (optional, for enrichment) |
+| Python | 3.10 – 3.12 recommended | python.org (3.13 works but some warnings) |
+| Java | 11 or 17 | `brew install openjdk@17` (macOS) / `apt install openjdk-17-jdk` (Linux) |
+| Apache Spark | 3.5.x (installed via pip) | Included in requirements.txt as `pyspark` |
+| Docker Desktop | 24+ | docker.com |
+| TMDB API key | free | themoviedb.org/settings/api |
+
+> **Note:** You do NOT need a standalone Spark installation. PySpark is installed via pip and includes `spark-submit`. Make sure `spark-submit` is on your PATH after `pip install`.
 
 ### Step-by-step pipeline
 
 ```bash
 # 1. Clone and install
-git clone <repo-url>
+git clone https://github.com/rishiboppana/MovieRecommendation.git
 cd MovieRecommendation
-cp .env.example .env         # set TMDB_API_KEY if you want poster images
+cp .env.example .env         # set TMDB_API_KEY for poster images
 pip3 install -r requirements.txt
 
-# 2. Download MovieLens 25M (~650 MB)
+# 2. Start infrastructure
+docker-compose up -d zookeeper kafka kafka-ui redis   # Redis + Kafka
+sleep 15                                               # wait for services
+python3 ingestion/init_topics.py                       # create Kafka topics
+
+# 3. Download MovieLens 25M (~650 MB)
 python3 data/download_datasets.py
 
-# 3. Start infrastructure
-brew services start redis    # Redis on port 6379
-docker-compose up -d zookeeper kafka kafka-ui  # Kafka (optional, for streaming)
+# 4. TMDB enrichment (run BEFORE ETL so posters are included)
+python3 data/tmdb_enrichment.py               # all 62K movies (~1 hour)
+# python3 data/tmdb_enrichment.py --limit 500 # quick test: 500 movies only
 
-# 4. Spark ETL (~8 min)
+# 5. Spark ETL (~8 min)
 make etl
-
-# 5. (Optional) TMDB enrichment
-python3 data/tmdb_enrichment.py --limit 500
 
 # 6. Train ALS model (~12 min)
 make train
@@ -1170,10 +1174,10 @@ make train
 # 7. Push 219K recs to Redis (~30 sec)
 make precompute
 
-# 8. Start services
+# 8. Start services (each in a separate terminal)
 make api-dev          # FastAPI on :8000
 make frontend-dev     # Streamlit on :8501
-mlflow server \       # MLflow UI on :5001
+mlflow server \
   --host 0.0.0.0 --port 5001 \
   --backend-store-uri "sqlite:///$(pwd)/mlflow/mlflow.db" \
   --default-artifact-root "$(pwd)/mlflow/artifacts" &
@@ -1185,6 +1189,8 @@ make stream-producer   # Terminal A
 make stream-consumer   # Terminal B
 ```
 
+> **Important:** TMDB enrichment (step 4) must run before ETL (step 5). The ETL loads TMDB metadata during processing — if you skip or run it after, movies will have no poster images in the UI.
+
 ### Service URLs
 
 | Service | URL | Purpose |
@@ -1193,13 +1199,14 @@ make stream-consumer   # Terminal B
 | FastAPI docs | http://localhost:8000/docs | Interactive API explorer |
 | MLflow UI | http://localhost:5001 | Experiment tracking, model registry |
 | Kafka UI | http://localhost:8090 | Topic and message browser |
-| Redis CLI | `redis-cli -p 6379 keys '*' | wc -l` | Verify 219K keys |
+| Redis CLI | `redis-cli -p 6379 keys '*' \| wc -l` | Verify 219K keys |
 
 ### Makefile shortcuts
 
 ```bash
 make setup          # install deps + create directories
 make download       # download datasets
+make enrich         # TMDB poster enrichment (run before ETL)
 make etl            # Spark ETL
 make train          # ALS training
 make precompute     # push recs to Redis
@@ -1209,8 +1216,19 @@ make tune           # Ray Tune HPO sweep
 make stream-demo    # mock streaming (no Kafka)
 make stream-producer # Kafka event producer
 make stream-consumer # Spark streaming consumer
+make pipeline       # full pipeline: infra → download → enrich → etl → train → precompute
 make clean          # remove __pycache__, checkpoints
 ```
+
+### Troubleshooting
+
+| Problem | Fix |
+|---|---|
+| `spark-submit: command not found` | Run `pip3 install -r requirements.txt` — pyspark installs it. Check `python3 -m pyspark.find_spark_home` |
+| API crashes on startup | Make sure Redis is running: `docker-compose up -d redis` |
+| No poster images in UI | Run TMDB enrichment before ETL, then re-run ETL and precompute |
+| `NoBrokersAvailable` | Start Kafka: `docker-compose up -d zookeeper kafka` and wait 15 seconds |
+| Spark RPC errors on re-run | Kill stale Spark processes: `pkill -f SparkSubmit` |
 
 ---
 

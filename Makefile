@@ -1,6 +1,6 @@
 .PHONY: setup infra-up infra-down download etl train precompute stream api frontend all clean
 
-SPARK_SUBMIT=/opt/spark/bin/spark-submit
+SPARK_SUBMIT=$(shell which spark-submit 2>/dev/null || echo /opt/spark/bin/spark-submit)
 SPARK_PACKAGES=org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0
 PYTHON=python3
 SPARK_COMMON=--conf spark.driver.bindAddress=127.0.0.1 --conf spark.driver.host=127.0.0.1
@@ -106,7 +106,7 @@ down:
 	docker-compose down
 
 # ---------- Full pipeline ----------
-pipeline: infra-up download etl train precompute
+pipeline: infra-up download enrich etl train precompute
 	@echo "Pipeline complete. Run 'make up' to start all services."
 
 # ---------- Clean ----------
