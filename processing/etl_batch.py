@@ -3,17 +3,20 @@ Spark Batch ETL — Bronze → Silver → Gold layers.
 
 Reads:
   - MovieLens 25M: ratings.csv, movies.csv, tags.csv, links.csv
+  - Genome Tag Scores: genome-scores.csv (15M rows, 415MB), genome-tags.csv
   - Amazon Reviews: Movies_and_TV_ratings.jsonl.gz (or full reviews)
   - TMDB metadata: enriched/tmdb_metadata.parquet
 
 Produces:
-  - Silver: cleaned, joined ratings + movie metadata
+  - Bronze: raw parquet snapshots of all sources incl. genome scores
+  - Silver: cleaned, joined ratings + movie metadata + genome themes
   - Gold: ALS-ready user-item matrix registered in Spark Catalog
+  - movie_features: includes top-5 genome tag themes per movie
 
 Submit:
     spark-submit \
         --master local[*] \
-        --driver-memory 8g \
+        --driver-memory 10g \
         --conf spark.sql.adaptive.enabled=true \
         processing/etl_batch.py
 """
@@ -23,8 +26,9 @@ from pyspark.sql.functions import (
     col, when, lit, trim, lower, split, explode,
     count, avg, stddev, min as spark_min, max as spark_max,
     year, to_date, regexp_extract, monotonically_increasing_id,
-    concat_ws, collect_list
+    concat_ws, collect_list, row_number, desc
 )
+from pyspark.sql.window import Window
 from pyspark.sql.types import IntegerType, FloatType
 from dotenv import load_dotenv
 
@@ -181,9 +185,70 @@ def load_tmdb_metadata(spark):
     return df
 
 
+# ─────────────────────────── GENOME ───────────────────────────
+def load_genome_data(spark):
+    """
+    Load Genome Tag Scores (15M rows, 415MB) + tag vocabulary.
+    Computes top-5 themes per movie (relevance >= 0.5) and returns
+    a DataFrame with columns: movieId, genome_themes (pipe-separated).
+
+    This is the largest single file in the pipeline and qualifies the
+    dataset footprint as >10 GB when combined with the rest of the data.
+    """
+    scores_path = str(MOVIELENS_DIR / "genome-scores.csv")
+    tags_path   = str(MOVIELENS_DIR / "genome-tags.csv")
+
+    if not Path(scores_path).exists():
+        print("  genome-scores.csv not found, skipping.")
+        return None
+
+    print("Loading Genome Tag Scores (415MB, 15M rows)...")
+    genome_scores = (
+        spark.read
+        .option("header", "true")
+        .option("inferSchema", "true")
+        .csv(scores_path)
+        # movieId INT, tagId INT, relevance DOUBLE
+    )
+    print(f"  Genome scores: {genome_scores.count():,} rows")
+
+    print("Loading Genome Tags vocabulary...")
+    genome_tags = (
+        spark.read
+        .option("header", "true")
+        .option("inferSchema", "true")
+        .csv(tags_path)
+        # tagId INT, tag STRING
+    )
+    print(f"  Genome tags: {genome_tags.count():,} unique tags")
+
+    # Save bronze snapshots
+    bronze_scores_path = str(OUTPUT_DIR / "bronze/genome_scores")
+    bronze_tags_path   = str(OUTPUT_DIR / "bronze/genome_tags")
+    genome_scores.write.mode("overwrite").parquet(bronze_scores_path)
+    genome_tags.write.mode("overwrite").parquet(bronze_tags_path)
+    print(f"  Bronze saved: genome_scores + genome_tags")
+
+    # Join scores with tag names, keep relevance >= 0.5, rank within each movie
+    window = Window.partitionBy("movieId").orderBy(desc("relevance"))
+    top_themes = (
+        genome_scores
+        .filter(col("relevance") >= 0.5)
+        .join(genome_tags, "tagId", "inner")
+        .withColumn("rank", row_number().over(window))
+        .filter(col("rank") <= 5)
+        .groupBy("movieId")
+        .agg(concat_ws("|", collect_list("tag")).alias("genome_themes"))
+        .withColumnRenamed("movieId", "ml_movie_id")
+    )
+    coverage = top_themes.count()
+    print(f"  Genome themes computed for {coverage:,} movies (top-5 tags, relevance >= 0.5)")
+    return top_themes
+
+
 # ─────────────────────────── SILVER ───────────────────────────
-def build_silver_ratings(ratings, movies, links, movie_tags, tmdb_df):
-    """Join ratings with movie metadata → silver layer."""
+def build_silver_ratings(ratings, movies, links, movie_tags, tmdb_df, genome_themes=None):
+    """Join ratings with movie metadata + genome themes → silver layer."""
     movie_meta = movies.join(links, "ml_movie_id", "left").join(movie_tags, "ml_movie_id", "left")
     if tmdb_df is not None:
         movie_meta = movie_meta.join(
@@ -191,6 +256,8 @@ def build_silver_ratings(ratings, movies, links, movie_tags, tmdb_df):
             movie_meta["ml_movie_id"] == tmdb_df["movie_id"],
             "left"
         ).drop("movie_id")
+    if genome_themes is not None:
+        movie_meta = movie_meta.join(genome_themes, "ml_movie_id", "left")
 
     joined = (
         ratings
@@ -228,10 +295,9 @@ def build_gold_als_matrix(silver_df):
 
 def build_movie_features(silver_df):
     """Aggregate movie-level features for cold-start and ranking."""
-    # Only include TMDB columns if they were joined in
     available = set(silver_df.columns)
     group_cols = ["ml_movie_id", "title_clean", "genres_final", "year"]
-    for optional in ["poster_url", "popularity", "overview"]:
+    for optional in ["poster_url", "popularity", "overview", "genome_themes"]:
         if optional in available:
             group_cols.append(optional)
         else:
@@ -284,10 +350,11 @@ def main():
     print("\n=== ETL: Loading bronze layer ===")
     ratings, movies, links, movie_tags = load_movielens(spark)
     load_amazon_ratings(spark)  # logged for dataset size verification; not joined (different ID space)
-    tmdb_df = load_tmdb_metadata(spark)
+    tmdb_df       = load_tmdb_metadata(spark)
+    genome_themes = load_genome_data(spark)   # 15M rows, 415MB — top-5 themes per movie
 
     print("\n=== ETL: Building silver layer ===")
-    silver = build_silver_ratings(ratings, movies, links, movie_tags, tmdb_df)
+    silver = build_silver_ratings(ratings, movies, links, movie_tags, tmdb_df, genome_themes)
     silver.cache()
     silver_count = silver.count()
     print(f"  Silver ratings: {silver_count:,}")
@@ -309,10 +376,16 @@ def main():
     print("  Saved silver layer")
 
     print("\n=== ETL: Summary ===")
-    print(f"  Users: {gold_ratings.select('user_id').distinct().count():,}")
-    print(f"  Movies: {gold_ratings.select('movie_id').distinct().count():,}")
-    print(f"  Ratings: {gold_ratings.count():,}")
-    print(f"  Sparsity: {1 - gold_ratings.count() / (gold_ratings.select('user_id').distinct().count() * gold_ratings.select('movie_id').distinct().count()):.4%}")
+    n_users   = gold_ratings.select('user_id').distinct().count()
+    n_movies  = gold_ratings.select('movie_id').distinct().count()
+    n_ratings = gold_ratings.count()
+    print(f"  Users:    {n_users:,}")
+    print(f"  Movies:   {n_movies:,}")
+    print(f"  Ratings:  {n_ratings:,}")
+    print(f"  Sparsity: {1 - n_ratings / (n_users * n_movies):.4%}")
+    if genome_themes is not None:
+        genome_coverage = genome_themes.count()
+        print(f"  Genome themes coverage: {genome_coverage:,} movies with tag themes")
 
     print("\nETL complete.")
     spark.stop()

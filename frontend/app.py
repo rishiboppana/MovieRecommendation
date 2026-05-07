@@ -568,13 +568,14 @@ def render_detail_panel():
         meta    = get_movie_detail(mid)
         similar = get_similar(mid, n=7)
 
-    title        = str(meta.get("title") or f"Movie {mid}")
-    poster       = meta.get("poster_url")
-    overview     = str(meta.get("overview") or "No overview available.")
-    genres       = str(meta.get("genres") or "")
-    year         = meta.get("year")
-    avg_rating   = meta.get("avg_rating")
-    rating_count = meta.get("rating_count")
+    title          = str(meta.get("title") or f"Movie {mid}")
+    poster         = meta.get("poster_url")
+    overview       = str(meta.get("overview") or "No overview available.")
+    genres         = str(meta.get("genres") or "")
+    year           = meta.get("year")
+    avg_rating     = meta.get("avg_rating")
+    rating_count   = meta.get("rating_count")
+    genome_themes  = meta.get("genome_themes")
 
     meta_parts = [str(int(year)) if year else "", genres]
     meta_str   = " · ".join(p for p in meta_parts if p)
@@ -608,11 +609,23 @@ def render_detail_panel():
             )
 
     with info_col:
+        genome_html = ""
+        if genome_themes:
+            tags = [t.strip() for t in genome_themes.split("|") if t.strip()]
+            tag_pills = "".join(
+                f'<span style="display:inline-block;background:#1c1c1c;border:1px solid #333;'
+                f'border-radius:12px;padding:2px 10px;margin:2px 3px 2px 0;font-size:0.75rem;'
+                f'color:#aaa;">{t}</span>'
+                for t in tags
+            )
+            genome_html = f'<div style="margin-top:8px;">{tag_pills}</div>'
+
         st.markdown(
             f'<div class="detail-meta">{meta_str}</div>'
             f'<div class="detail-title">{title}</div>'
             f'<div class="detail-rating">{rating_str}</div>'
-            f'<div class="detail-overview">{overview}</div>',
+            f'<div class="detail-overview">{overview}</div>'
+            f'{genome_html}',
             unsafe_allow_html=True,
         )
         st.markdown("<br>", unsafe_allow_html=True)

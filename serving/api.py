@@ -366,6 +366,7 @@ def get_movie_meta(movie_id: int) -> dict:
         "overview": str(r["overview"]) if pd.notna(r.get("overview")) else None,
         "avg_rating": float(r["avg_rating"]) if pd.notna(r.get("avg_rating")) else None,
         "rating_count": int(r["rating_count"]) if pd.notna(r.get("rating_count")) else None,
+        "genome_themes": str(r["genome_themes"]) if pd.notna(r.get("genome_themes")) else None,
     }
 
 

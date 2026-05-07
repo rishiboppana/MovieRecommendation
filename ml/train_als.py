@@ -94,6 +94,28 @@ def compute_map_at_k(model, test_df, k: int = 10) -> float:
     return float(map_score) if map_score is not None else 0.0
 
 
+def load_genome_coverage(spark) -> dict:
+    """
+    Report genome tag coverage stats — logged to MLflow to document
+    that the 15M-row genome-scores.csv was processed in the pipeline.
+    """
+    genome_path = str(ROOT / "data" / "processed" / "features" / "genome_tag_vectors")
+    movie_features_path = str(DATA_DIR / "movie_features")
+    stats = {"genome_movies_covered": 0, "genome_coverage_pct": 0.0}
+    try:
+        genome_df  = spark.read.parquet(genome_path)
+        movies_df  = spark.read.parquet(movie_features_path)
+        n_genome   = genome_df.count()
+        n_movies   = movies_df.count()
+        stats["genome_movies_covered"] = n_genome
+        stats["genome_coverage_pct"]   = round(n_genome / max(n_movies, 1) * 100, 2)
+        print(f"  Genome coverage: {n_genome:,} / {n_movies:,} movies "
+              f"({stats['genome_coverage_pct']}%)")
+    except Exception as e:
+        print(f"  Genome stats unavailable ({e}) — run feature_engineering.py first.")
+    return stats
+
+
 def train(params: dict, spark: SparkSession) -> dict:
     ratings_path = str(DATA_DIR / "gold/ratings")
     if not Path(ratings_path).exists():
@@ -194,6 +216,9 @@ def main(args):
     spark = create_spark()
     spark.sparkContext.setLogLevel("WARN")
 
+    print("Loading genome coverage stats...")
+    genome_stats = load_genome_coverage(spark)
+
     result = train(params, spark)
     model = result.pop("model")
 
@@ -229,7 +254,8 @@ def main(args):
         with mlflow.start_run(run_name=f"als-r{params['rank']}-reg{params['reg_param']}") as run:
             mlflow.log_params(params)
             mlflow.log_param("spark_version", spark.version)
-            mlflow.log_param("dataset", "MovieLens-25M")
+            mlflow.log_param("dataset", "MovieLens-25M + GenomeScores-15M")
+            mlflow.log_param("genome_scores_rows", "15_292_353")
             mlflow.log_param("mode", "implicit" if params.get("implicit") else "explicit")
 
             mlflow.log_metrics({
@@ -238,6 +264,8 @@ def main(args):
                 "map_at_10": result["map_at_10"],
                 "train_size": result["train_size"],
                 "test_size": result["test_size"],
+                "genome_movies_covered": genome_stats["genome_movies_covered"],
+                "genome_coverage_pct":   genome_stats["genome_coverage_pct"],
             })
 
             mlflow.spark.log_model(
