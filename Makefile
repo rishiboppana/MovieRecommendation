@@ -90,6 +90,10 @@ stream-consumer:
 		--conf spark.sql.streaming.checkpointLocation=./data/checkpoints \
 		ingestion/spark_streaming.py
 
+stream-demo:
+	@echo "Starting mock streaming (no Kafka/Docker required)..."
+	$(PYTHON) ingestion/mock_streaming.py
+
 # ---------- Frontend ----------
 frontend-dev:
 	cd frontend && streamlit run app.py --server.port 8501
