@@ -1,10 +1,16 @@
 """
 CineRec — Netflix-style Movie Recommendation UI
-Model: Spark MLlib ALS trained on 25M ratings (MovieLens 25M + Amazon 7.4M)
+Model: Spark MLlib ALS trained on 25M ratings (MovieLens 25M dataset)
 """
 import os
+import sqlite3
 import requests
+import pandas as pd
+import pyarrow.parquet as pq
+import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
+from pathlib import Path
 
 API_URL = os.getenv("API_URL", "http://localhost:8000")
 
@@ -16,12 +22,20 @@ st.set_page_config(
 )
 
 # ── Session state ──
-if "liked_movies" not in st.session_state:
-    st.session_state.liked_movies = {}
+if "all_liked_movies" not in st.session_state:
+    st.session_state.all_liked_movies = {}  # {user_id: {movie_id: info}}
 if "user_id" not in st.session_state:
     st.session_state.user_id = 1
 if "active_tab" not in st.session_state:
     st.session_state.active_tab = "home"
+if "selected_movie_id" not in st.session_state:
+    st.session_state.selected_movie_id = None
+if "rate_reset" not in st.session_state:
+    st.session_state.rate_reset = 0
+if "search_reset" not in st.session_state:
+    st.session_state.search_reset = 0
+if "rate_selected_movie" not in st.session_state:
+    st.session_state.rate_selected_movie = None
 
 # ─────────────────────────── Styles ───────────────────────────
 st.markdown("""
@@ -252,6 +266,24 @@ div[data-testid="stSlider"] > div > div > div {
 
 /* ---------- Divider ---------- */
 hr { border-color: #1e1e1e !important; margin: 0.3rem 0 !important; }
+
+/* ---------- Detail panel ---------- */
+.detail-panel {
+    background: #141414;
+    border: 1px solid #1e1e1e;
+    border-radius: 10px;
+    padding: 1.5rem;
+    margin: 0.6rem 0 1rem;
+}
+.detail-title {
+    font-size: 1.9rem; font-weight: 700; color: #fff;
+    margin: 0.3rem 0 0.5rem; line-height: 1.15;
+}
+.detail-meta   { font-size: 0.8rem; color: #666; letter-spacing: 0.3px; }
+.detail-rating { font-size: 0.95rem; color: #e50914; margin-bottom: 0.9rem; }
+.detail-overview {
+    font-size: 0.9rem; color: #bbb; line-height: 1.75; max-width: 72ch;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -298,11 +330,13 @@ def get_from_likes(liked: dict, n: int = 14):
     if not liked:
         return []
     try:
+        # Use uniform weight=1.0 for each like so the ALS solver aggregates
+        # user taste across titles rather than amplifying movies with higher
+        # precomputed 'score' values stored in the UI state.
         payload = {
             "likes": [
-                {"movie_id": mid,
-                 "weight": min(max(float(info.get("score") or 1.0), 0.1), 5.0)}
-                for mid, info in liked.items()
+                {"movie_id": mid, "weight": 1.0}
+                for mid in liked.keys()
             ],
             "n": n,
         }
@@ -311,16 +345,36 @@ def get_from_likes(liked: dict, n: int = 14):
     except Exception:
         return []
 
-def post_rating(user_id: int, movie_id: int, rating: float) -> bool:
+def post_rating(
+    user_id: int, movie_id: int, rating: float,
+    review: str = "", username: str = "",
+) -> bool:
     try:
         r = requests.post(
             f"{API_URL}/rate",
-            json={"user_id": user_id, "movie_id": movie_id, "rating": rating},
+            json={
+                "user_id": user_id,
+                "movie_id": movie_id,
+                "rating": rating,
+                "review": review.strip() or None,
+                "username": username.strip() or None,
+            },
             timeout=5,
         )
         return r.ok
     except Exception:
         return False
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def get_reviews(movie_id: int, limit: int = 15):
+    try:
+        r = requests.get(
+            f"{API_URL}/reviews/{movie_id}", params={"limit": limit}, timeout=5
+        )
+        return r.json() if r.ok else []
+    except Exception:
+        return []
 
 def get_health():
     try:
@@ -329,6 +383,109 @@ def get_health():
     except Exception:
         return {}
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_movie_rating_dist(movie_id: int):
+    """Load star-rating distribution for a specific movie from the gold parquet."""
+    try:
+        path = _DATA_ROOT / "data" / "processed" / "gold" / "ratings"
+        table = pq.read_table(str(path), filters=[("movie_id", "=", movie_id)])
+        df = table.to_pandas()
+        dist = df["rating"].value_counts().sort_index().reset_index()
+        dist.columns = ["rating", "count"]
+        dist["pct"] = (dist["count"] / dist["count"].sum() * 100).round(1)
+        return dist
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def get_movie_detail(movie_id: int):
+    try:
+        r = requests.get(f"{API_URL}/movies/{movie_id}", timeout=5)
+        return r.json() if r.ok else {}
+    except Exception:
+        return {}
+
+@st.cache_data(ttl=600, show_spinner=False)
+def get_similar(movie_id: int, n: int = 7):
+    try:
+        r = requests.get(f"{API_URL}/similar/{movie_id}", params={"n": n}, timeout=5)
+        return r.json() if r.ok else []
+    except Exception:
+        return []
+
+
+# ─────────────────────────── Analytics data ───────────────────
+_DATA_ROOT = Path(__file__).parent.parent
+
+_PLOT_BASE = dict(
+    paper_bgcolor="#111111",
+    plot_bgcolor="#111111",
+    font=dict(family="Inter, -apple-system, sans-serif", color="#999", size=11),
+    margin=dict(l=4, r=4, t=36, b=4),
+    xaxis=dict(gridcolor="#1e1e1e", zerolinecolor="#1e1e1e"),
+    yaxis=dict(gridcolor="#1e1e1e", zerolinecolor="#1e1e1e"),
+    colorway=["#e50914", "#c5000f", "#888", "#555", "#333"],
+)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_analytics():
+    out = {}
+
+    mp = _DATA_ROOT / "data" / "processed" / "movie_features"
+    if mp.exists():
+        out["movies"] = pq.read_table(str(mp)).to_pandas()
+
+    up = _DATA_ROOT / "data" / "processed" / "user_features"
+    if up.exists():
+        out["users"] = pq.read_table(str(up)).to_pandas()
+
+    gp = _DATA_ROOT / "data" / "processed" / "gold" / "ratings"
+    if gp.exists():
+        raw = pq.read_table(str(gp), columns=["rating"]).to_pandas()
+        dist = raw["rating"].value_counts().sort_index().reset_index()
+        dist.columns = ["rating", "count"]
+        out["rating_dist"] = dist
+        del raw
+
+    db = _DATA_ROOT / "mlflow" / "mlflow.db"
+    if db.exists():
+        try:
+            conn = sqlite3.connect(str(db))
+            # Pick metrics from the final production run only (not HPO trials)
+            mdf = pd.read_sql("""
+                SELECT m.key, m.value
+                FROM metrics m
+                JOIN runs r ON m.run_uuid = r.run_uuid
+                WHERE r.status = 'FINISHED'
+                  AND r.name NOT LIKE 'ray-tune-%'
+                ORDER BY r.start_time DESC
+            """, conn)
+            conn.close()
+            out["metrics"] = dict(zip(mdf["key"], mdf["value"]))
+        except Exception:
+            out["metrics"] = {}
+
+    return out
+
+
+def _genre_stats(movies: pd.DataFrame) -> pd.DataFrame:
+    exploded = (
+        movies[["movie_id", "genres", "rating_count", "avg_rating"]]
+        .assign(genre=movies["genres"].str.split("|"))
+        .explode("genre")
+    )
+    exploded = exploded[exploded["genre"].notna() & (exploded["genre"] != "") & (exploded["genre"] != "(no genres listed)")]
+    return (
+        exploded.groupby("genre")
+        .agg(movie_count=("movie_id", "count"),
+             total_ratings=("rating_count", "sum"),
+             avg_rating=("avg_rating", "mean"))
+        .sort_values("total_ratings", ascending=False)
+        .reset_index()
+    )
+
 
 # ─────────────────────────── Card renderer ────────────────────
 def render_card(col, movie: dict, key_prefix: str):
@@ -336,7 +493,9 @@ def render_card(col, movie: dict, key_prefix: str):
     title  = str(movie.get("title") or f"Movie {mid}")
     genres = str(movie.get("genres") or "")
     poster = movie.get("poster_url")
-    is_liked = mid in st.session_state.liked_movies
+    _uid   = st.session_state.user_id
+    _liked = st.session_state.all_liked_movies.setdefault(_uid, {})
+    is_liked = mid in _liked
 
     liked_cls  = "liked-outline" if is_liked else ""
     liked_dot  = '<div class="liked-dot"></div>' if is_liked else ""
@@ -370,17 +529,22 @@ def render_card(col, movie: dict, key_prefix: str):
               </div>
             </div>""", unsafe_allow_html=True)
 
-        btn_label = "Remove" if is_liked else "Add to My List"
-        if st.button(btn_label, key=f"{key_prefix}_{mid}", use_container_width=True):
-            if is_liked:
-                st.session_state.liked_movies.pop(mid, None)
-            else:
-                score = float(movie.get("score") or movie.get("avg_rating") or 3.5)
-                st.session_state.liked_movies[mid] = {
-                    "title": title, "genres": genres,
-                    "poster_url": poster, "score": score,
-                }
-            st.rerun()
+        d_col, l_col = st.columns(2)
+        with d_col:
+            if st.button("Details", key=f"dt_{key_prefix}_{mid}", use_container_width=True):
+                st.session_state.selected_movie_id = mid
+                st.rerun()
+        with l_col:
+            btn_label = "Remove" if is_liked else "Add to List"
+            if st.button(btn_label, key=f"{key_prefix}_{mid}", use_container_width=True):
+                if is_liked:
+                    _liked.pop(mid, None)
+                else:
+                    score = float(movie.get("score") or movie.get("avg_rating") or 3.5)
+                    _liked[mid] = {
+                        "title": title, "genres": genres,
+                        "poster_url": poster, "score": score,
+                    }
 
 
 def render_row(heading: str, movies: list, key_prefix: str,
@@ -395,9 +559,160 @@ def render_row(heading: str, movies: list, key_prefix: str,
         render_card(cols[i], movie, key_prefix=f"{key_prefix}_{i}")
 
 
+def render_detail_panel():
+    mid = st.session_state.selected_movie_id
+    if mid is None:
+        return
+
+    with st.spinner("Loading details…"):
+        meta    = get_movie_detail(mid)
+        similar = get_similar(mid, n=7)
+
+    title        = str(meta.get("title") or f"Movie {mid}")
+    poster       = meta.get("poster_url")
+    overview     = str(meta.get("overview") or "No overview available.")
+    genres       = str(meta.get("genres") or "")
+    year         = meta.get("year")
+    avg_rating   = meta.get("avg_rating")
+    rating_count = meta.get("rating_count")
+
+    meta_parts = [str(int(year)) if year else "", genres]
+    meta_str   = " · ".join(p for p in meta_parts if p)
+
+    rating_str = ""
+    if avg_rating is not None:
+        rating_str = f"{float(avg_rating):.2f} ★"
+        if rating_count:
+            rating_str += f"  ·  {int(rating_count):,} ratings"
+
+    st.markdown('<div class="detail-panel">', unsafe_allow_html=True)
+
+    # Close button in its own column so it doesn't stretch full-width
+    hdr_col, close_col = st.columns([10, 1])
+    with close_col:
+        if st.button("✕ Close", key="detail_close", use_container_width=True):
+            st.session_state.selected_movie_id = None
+            st.rerun()
+
+    img_col, info_col = st.columns([1, 3])
+
+    with img_col:
+        if poster:
+            st.image(poster, use_column_width=True)
+        else:
+            st.markdown(
+                '<div style="width:100%;aspect-ratio:2/3;background:#1c1c1c;'
+                'border-radius:6px;display:flex;align-items:center;'
+                'justify-content:center;color:#555;font-size:0.8rem;">No poster</div>',
+                unsafe_allow_html=True,
+            )
+
+    with info_col:
+        st.markdown(
+            f'<div class="detail-meta">{meta_str}</div>'
+            f'<div class="detail-title">{title}</div>'
+            f'<div class="detail-rating">{rating_str}</div>'
+            f'<div class="detail-overview">{overview}</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown("<br>", unsafe_allow_html=True)
+        # Add to My List button inside the detail panel
+        _uid_det  = st.session_state.user_id
+        _liked_det = st.session_state.all_liked_movies.setdefault(_uid_det, {})
+        is_liked  = mid in _liked_det
+        btn_lbl   = "▼ Remove from My List" if is_liked else "+ Add to My List"
+        if st.button(btn_lbl, key=f"det_list_{mid}"):
+            if is_liked:
+                _liked_det.pop(mid, None)
+            else:
+                score = float(meta.get("avg_rating") or 3.5)
+                _liked_det[mid] = {
+                    "title": title, "genres": genres,
+                    "poster_url": poster, "score": score,
+                }
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # ── Community Reviews (full-width, 2-col grid) ──
+    st.markdown(
+        '<div class="section-title" style="margin-top:1.2rem;">Community Reviews</div>',
+        unsafe_allow_html=True,
+    )
+    det_reviews = get_reviews(mid, limit=10)
+    if det_reviews:
+        rv_left, rv_right = st.columns(2)
+        for idx, rv in enumerate(det_reviews):
+            stars        = "★" * round(rv["rating"]) + "☆" * (5 - round(rv["rating"]))
+            date_str     = rv["created_at"][:10] if rv.get("created_at") else ""
+            review_body  = rv.get("review") or ""
+            display_name = rv.get("username") or f"User {rv['user_id']}"
+            body_html = (
+                f'<div style="font-size:0.8rem;color:#aaa;line-height:1.6;margin-top:0.25rem;">'
+                f'{review_body}</div>'
+                if review_body else
+                '<div style="font-size:0.72rem;color:#555;font-style:italic;">No written review</div>'
+            )
+            card_html = (
+                f'<div style="background:#161616;border:1px solid #222;border-radius:6px;'
+                f'padding:0.7rem 0.9rem;margin-bottom:0.45rem;">'
+                f'<div style="display:flex;justify-content:space-between;align-items:center;">'
+                f'<span style="color:#e8a010;font-size:0.82rem;letter-spacing:1px;">{stars}</span>'
+                f'<span style="font-size:0.68rem;color:#555;">{display_name} · {date_str}</span>'
+                f'</div>{body_html}</div>'
+            )
+            target = rv_left if idx % 2 == 0 else rv_right
+            target.markdown(card_html, unsafe_allow_html=True)
+    else:
+        st.markdown(
+            '<div style="font-size:0.8rem;color:#555;font-style:italic;margin-bottom:0.8rem;">'
+            'No reviews yet.</div>',
+            unsafe_allow_html=True,
+        )
+
+    # ── Similar Movies (full-width, outside any column context) ──
+    if similar:
+        render_row("Similar Movies", similar, "sim_det", n_cols=7)
+
+    st.markdown("<hr>", unsafe_allow_html=True)
+
+
+def _render_rate_thumb(col, movie: dict, key_prefix: str):
+    """Compact selectable thumbnail for the Rate tab."""
+    mid = int(movie.get("movie_id") or 0)
+    title = str(movie.get("title") or f"Movie {mid}")
+    poster = movie.get("poster_url")
+    is_selected = (
+        st.session_state.rate_selected_movie is not None
+        and int(st.session_state.rate_selected_movie.get("movie_id", -1)) == mid
+    )
+    border = "border:2px solid #e50914;" if is_selected else "border:2px solid transparent;"
+    short = title[:20] + ("…" if len(title) > 20 else "")
+    with col:
+        if poster:
+            st.markdown(
+                f'<div style="aspect-ratio:2/3;overflow:hidden;border-radius:4px;{border}">'
+                f'<img src="{poster}" style="width:100%;height:100%;object-fit:cover;" /></div>'
+                f'<div style="font-size:0.6rem;color:#aaa;text-align:center;margin-top:2px;'
+                f'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{short}</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                f'<div style="aspect-ratio:2/3;background:#1c1c1c;border-radius:4px;{border}'
+                f'display:flex;align-items:center;justify-content:center;'
+                f'font-size:0.6rem;color:#888;text-align:center;padding:0.3rem;">'
+                f'{short}</div>',
+                unsafe_allow_html=True,
+            )
+        btn_lbl = "✓" if is_selected else "Select"
+        if st.button(btn_lbl, key=f"{key_prefix}_{mid}", use_container_width=True):
+            st.session_state.rate_selected_movie = movie
+            st.rerun()
+
+
 # ─────────────────────────── Top navigation ───────────────────
 health = get_health()
-liked  = st.session_state.liked_movies
+liked  = st.session_state.all_liked_movies.setdefault(st.session_state.user_id, {})
 n_liked = len(liked)
 
 nav_l, nav_mid, nav_r = st.columns([2, 5, 3])
@@ -406,24 +721,43 @@ with nav_l:
 
 with nav_mid:
     search_query = st.text_input(
-        "search", placeholder="Search movies, genres, directors…",
-        label_visibility="collapsed"
+        "search", placeholder="Search movie titles or genres…",
+        label_visibility="collapsed",
+        key=f"main_search_{st.session_state.search_reset}",
     )
 
+_DEMO_PROFILES = {
+    "Demo User A": 42,
+    "Demo User B": 500,
+    "Demo User C": 7777,
+    "Demo User D": 50000,
+    "Demo User E": 120000,
+    "Custom…": None,
+}
+
 with nav_r:
-    uid_col, status_col = st.columns([3, 2])
-    with uid_col:
-        new_uid = st.number_input(
-            "User ID", min_value=1, max_value=162541,
-            value=st.session_state.user_id, step=1,
-            label_visibility="visible"
+    profile_col, status_col = st.columns([3, 2])
+    with profile_col:
+        selected_profile = st.selectbox(
+            "Profile",
+            options=list(_DEMO_PROFILES.keys()),
+            key="profile_select",
+            label_visibility="visible",
         )
-        if new_uid != st.session_state.user_id:
+        preset_uid = _DEMO_PROFILES[selected_profile]
+        if preset_uid is not None:
+            new_uid = preset_uid
+        else:
+            new_uid = st.number_input(
+                "User ID", min_value=1, max_value=162541,
+                value=st.session_state.user_id, step=1,
+                label_visibility="collapsed",
+            )
+        if int(new_uid) != st.session_state.user_id:
             st.session_state.user_id = int(new_uid)
             get_recommendations.clear()
             st.rerun()
     with status_col:
-        redis_ok = health.get("redis", False)
         movies_n = health.get("movies_loaded", 0)
         st.markdown(f"""
         <div style="font-size:0.7rem;color:#555;margin-top:1.9rem;line-height:1.8">
@@ -435,10 +769,19 @@ st.markdown("<hr>", unsafe_allow_html=True)
 
 user_id = st.session_state.user_id
 
+# ── Detail panel (persists across search and browse modes) ────
+if st.session_state.selected_movie_id:
+    render_detail_panel()
+
 # ══════════════════════════════════════════════════════════════
 # SEARCH MODE
 # ══════════════════════════════════════════════════════════════
 if search_query and len(search_query.strip()) >= 2:
+    _back_col, _ = st.columns([1, 9])
+    with _back_col:
+        if st.button("← Back", key="search_back", use_container_width=True):
+            st.session_state.search_reset += 1
+            st.rerun()
     results = get_by_genre(search_query.strip(), n=28)
     count = len(results)
     st.markdown(
@@ -447,6 +790,68 @@ if search_query and len(search_query.strip()) >= 2:
         unsafe_allow_html=True,
     )
     if results:
+        # Feature the best match for faster scanning
+        top = results[0]
+        top_title = str(top.get("title") or "")
+        top_genres = str(top.get("genres") or "")
+        top_avg = top.get("avg_rating")
+        top_cnt = top.get("rating_count")
+        top_match = top.get("match_score")
+        top_poster = top.get("poster_url")
+
+        st.markdown(
+            """
+            <div style="display:flex; gap:1.2rem; align-items:flex-start;
+                        background:#141414; border:1px solid #222; border-radius:10px;
+                        padding:1rem; margin:0.8rem 0 1.2rem;">
+              <div style="width:120px; flex:0 0 120px;">
+            """,
+            unsafe_allow_html=True,
+        )
+        if top_poster:
+            st.markdown(
+                f'<img src="{top_poster}" style="width:120px; border-radius:8px; display:block;" />',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                '<div style="width:120px; height:180px; border-radius:8px;'
+                ' background:#1f1f1f; display:flex; align-items:center; justify-content:center;'
+                ' color:#666; font-size:0.8rem;">No poster</div>',
+                unsafe_allow_html=True,
+            )
+
+        # Right side details
+        stats = []
+        if top_avg is not None:
+            stats.append(f"Avg rating: {float(top_avg):.2f}")
+        if top_cnt is not None:
+            stats.append(f"Ratings: {int(top_cnt):,}")
+        if top_match is not None:
+            stats.append(f"Match: {float(top_match):.2f}")
+        stats_str = " · ".join(stats) if stats else ""
+
+        st.markdown(
+            f"""
+              </div>
+              <div style="flex:1 1 auto; min-width:0;">
+                <div style="font-size:0.75rem; color:#777; letter-spacing:0.3px;">Top match</div>
+                <div style="font-size:1.35rem; font-weight:700; color:#e50914; margin-top:0.15rem;
+                            word-break:break-word;">
+                  {top_title}
+                </div>
+                <div style="font-size:0.9rem; color:#aaa; margin-top:0.25rem;">
+                  {top_genres}
+                </div>
+                <div style="font-size:0.82rem; color:#666; margin-top:0.45rem;">
+                  {stats_str}
+                </div>
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
         n_cols = 7
         for row_start in range(0, min(count, 28), n_cols):
             row = results[row_start:row_start + n_cols]
@@ -462,20 +867,24 @@ if search_query and len(search_query.strip()) >= 2:
 # BROWSE MODE
 # ══════════════════════════════════════════════════════════════
 else:
-    tab_home, tab_list, tab_trending, tab_rate = st.tabs([
+    tab_home, tab_list, tab_trending, tab_rate, tab_analytics = st.tabs([
         "Home",
-        f"My List  {('· ' + str(n_liked)) if n_liked else ''}",
+        "My List",
         "Trending",
         "Rate",
+        "Analytics",
     ])
 
     # ── HOME ──────────────────────────────────────────────────
     with tab_home:
         # Hero
         popular = get_popular(n=21)
-        hero = next((m for m in popular if m.get("poster_url")), popular[0] if popular else None)
+        _poster_picks = [m for m in popular if m.get("poster_url")]
+        _hero_idx = pd.Timestamp.now().dayofyear % max(4, min(7, len(_poster_picks)))
+        hero = _poster_picks[_hero_idx] if _poster_picks else (popular[0] if popular else None)
 
         if hero:
+            hero_mid = int(hero.get("movie_id") or 0)
             ov = hero.get("overview") or "A critically acclaimed film you will love."
             st.markdown(f"""
             <div class="hero-wrap">
@@ -485,12 +894,31 @@ else:
                 <div class="hero-title">{hero.get('title','')}</div>
                 <div class="hero-meta">{hero.get('genres','')[:55]}</div>
                 <div class="hero-desc">{ov[:220]}</div>
-                <div class="hero-actions">
-                  <button class="btn-play">Play</button>
-                  <button class="btn-more">More Info</button>
-                </div>
               </div>
             </div>""", unsafe_allow_html=True)
+
+            # Real Streamlit buttons overlaid at bottom-left of hero via CSS
+            st.markdown("""<style>
+            div[data-testid="stHorizontalBlock"].hero-btn-row {
+                margin-top:-4.6rem !important;
+                padding-left:4.2% !important;
+                margin-bottom:3.8rem !important;
+                position:relative; z-index:10;
+            }
+            div[data-testid="stHorizontalBlock"].hero-btn-row button {
+                border-radius:4px !important; font-weight:600 !important;
+                font-size:0.88rem !important; padding:0.55rem 0 !important;
+            }
+            </style>""", unsafe_allow_html=True)
+            st.markdown('<div class="hero-btn-row">', unsafe_allow_html=True)
+            _pc, _mc, _ = st.columns([1, 1, 8])
+            with _pc:
+                st.button("▶  Play", key="hero_play", use_container_width=True)
+            with _mc:
+                if st.button("ℹ  More Info", key="hero_more_info", use_container_width=True):
+                    st.session_state.selected_movie_id = hero_mid
+                    st.rerun()
+            st.markdown('</div>', unsafe_allow_html=True)
 
         # Taste model row — only when user has likes
         if liked:
@@ -534,7 +962,7 @@ else:
             ("Drama",           "Drama"),
             ("Action",          "Action"),
             ("Comedy",          "Comedy"),
-            ("Science Fiction", "Sci-Fi"),
+            ("Science Fiction", "Science Fiction"),
             ("Thriller",        "Thriller"),
             ("Romance",         "Romance"),
             ("Horror",          "Horror"),
@@ -580,7 +1008,7 @@ else:
 
             st.markdown("<br>", unsafe_allow_html=True)
             if st.button("Clear My List", use_container_width=False):
-                st.session_state.liked_movies.clear()
+                st.session_state.all_liked_movies.get(user_id, {}).clear()
                 st.rerun()
 
     # ── TRENDING ──────────────────────────────────────────────
@@ -604,34 +1032,463 @@ else:
     with tab_rate:
         st.markdown('<div class="section-title">Rate a Movie</div>', unsafe_allow_html=True)
 
-        r_col1, r_col2 = st.columns([1, 1])
-        with r_col1:
-            rate_id  = st.number_input("Movie ID", min_value=1, value=1, step=1)
-            rate_val = st.slider("Rating", 0.5, 5.0, 4.0, 0.5)
-            if st.button("Submit Rating", type="primary", use_container_width=True):
-                ok = post_rating(user_id, int(rate_id), rate_val)
-                if ok:
-                    st.success(f"Submitted: {rate_val} stars for movie {rate_id}")
-                    get_recommendations.clear()
-                else:
-                    st.error("Submission failed — check API is running")
+        rate_search = st.text_input(
+            "Search for a movie",
+            placeholder="e.g., Inception, The Matrix, Toy Story...",
+            key=f"rate_search_{st.session_state.rate_reset}",
+        )
 
-        with r_col2:
-            st.markdown("""
-            <div class="info-box">
-              <b>How the recommendation pipeline works</b><br><br>
-              1. Your rating hits <b>POST /rate</b> on the FastAPI server<br>
-              2. The API publishes it to the <b class="red">Kafka</b> topic
-                 <code>user-events</code><br>
-              3. <b>Spark Structured Streaming</b> consumes events in real time,
-                 aggregates trending windows, and writes results to Redis<br>
-              4. The Trending tab reflects live engagement within seconds<br><br>
-              <b>The model</b><br><br>
-              <span class="red">Spark MLlib ALS</span> — trained on
-              <b>25 million ratings</b> from MovieLens 25M and 7.4 million
-              Amazon review ratings. The algorithm learns 100-dimensional
-              latent vectors for every user and movie. The
-              <b>Add to My List</b> feature solves for your personal user
-              vector using the ALS update equation in real time — no
-              retraining required.
-            </div>""", unsafe_allow_html=True)
+        if rate_search and len(rate_search) >= 2:
+            with st.spinner("Searching…"):
+                try:
+                    _rate_results = requests.get(
+                        f"{API_URL}/movies/search",
+                        params={"q": rate_search, "limit": 18},
+                        timeout=5,
+                    ).json()
+                except Exception as _e:
+                    _rate_results = []
+                    st.error(f"Search failed: {_e}")
+
+            if _rate_results:
+                st.markdown(
+                    '<div style="font-size:0.78rem;color:#666;margin:0.5rem 0 0.3rem;">'
+                    'Click <b style="color:#ccc">Select</b> on a movie below</div>',
+                    unsafe_allow_html=True,
+                )
+                _n_rt = 7
+                for _rrow in range(0, len(_rate_results), _n_rt):
+                    _rt_batch = _rate_results[_rrow:_rrow + _n_rt]
+                    _rt_cols = st.columns(_n_rt)
+                    for _ri, _rm in enumerate(_rt_batch):
+                        _render_rate_thumb(_rt_cols[_ri], _rm, f"rt_{_rrow}_{_ri}")
+            else:
+                st.info("No movies found. Try a different search.")
+        elif rate_search and len(rate_search) < 2:
+            st.info("Type at least 2 characters to search")
+
+        # ── Selected movie details + rating ──
+        _sel = st.session_state.rate_selected_movie
+        if _sel:
+            st.markdown("<hr>", unsafe_allow_html=True)
+            _det_col, _rev_col = st.columns([1, 1])
+
+            with _det_col:
+                rate_id = _sel.get("movie_id")
+                avg_r   = float(_sel.get("avg_rating") or 0)
+                n_r     = int(_sel.get("rating_count") or 0)
+                filled  = "★" * round(avg_r) + "☆" * (5 - round(avg_r))
+                st.markdown(f"""
+                <div style="background:#1a1a1a;padding:1rem;border-radius:6px;
+                            margin-top:0.5rem;border-left:3px solid #e50914;">
+                  <div style="font-size:0.78rem;color:#777;">Selected</div>
+                  <div style="font-size:1.15rem;font-weight:700;color:#e50914;margin:0.2rem 0;">
+                    {_sel['title']}
+                  </div>
+                  <div style="font-size:0.9rem;color:#e8a010;letter-spacing:2px;">{filled}</div>
+                  <div style="font-size:0.78rem;color:#666;margin-top:0.3rem;">
+                    Avg: {avg_r:.2f} ★ &nbsp;·&nbsp; {n_r:,} ratings &nbsp;·&nbsp; ID: {rate_id}
+                  </div>
+                </div>""", unsafe_allow_html=True)
+
+                with st.spinner("Loading ratings…"):
+                    rdist = get_movie_rating_dist(int(rate_id))
+                if rdist is not None and not rdist.empty:
+                    st.markdown(
+                        '<div style="font-size:0.78rem;color:#666;margin:0.8rem 0 0.2rem;">'
+                        'How others rated this movie</div>',
+                        unsafe_allow_html=True,
+                    )
+                    fig_rd = px.bar(
+                        rdist, x="rating", y="count",
+                        text=rdist["pct"].astype(str) + "%",
+                        labels={"rating": "Stars", "count": "Ratings"},
+                        color_discrete_sequence=["#e50914"],
+                        height=160,
+                    )
+                    fig_rd.update_layout(
+                        **{k: v for k, v in _PLOT_BASE.items() if k not in ("margin",)},
+                        margin=dict(l=0, r=0, t=4, b=0),
+                        showlegend=False,
+                        title=None,
+                    )
+                    fig_rd.update_traces(
+                        marker_line_width=0,
+                        textposition="outside",
+                        textfont=dict(color="#666", size=9),
+                    )
+                    st.plotly_chart(fig_rd, use_container_width=True)
+
+                st.markdown("<br>", unsafe_allow_html=True)
+                rate_val = st.slider(
+                    "Your Rating", 0.5, 5.0, 3.0, 0.5,
+                    key=f"rate_slider_{st.session_state.rate_reset}",
+                )
+                review_text = st.text_area(
+                    "Write a review (optional)",
+                    placeholder="What did you think? Any standout scenes, performances, or reasons you'd recommend it?",
+                    height=120,
+                    key=f"rate_review_{st.session_state.rate_reset}",
+                )
+                if st.button("Submit Rating", type="primary", use_container_width=True):
+                    ok = post_rating(user_id, int(rate_id), rate_val, review_text,
+                                     username=selected_profile)
+                    if ok:
+                        rev_note = " · Review saved ✍" if review_text.strip() else ""
+                        st.success(f"✓ Submitted {rate_val}★ for {_sel['title']}{rev_note}")
+                        get_recommendations.clear()
+                        get_reviews.clear()
+                        st.session_state.rate_selected_movie = None
+                        st.session_state.rate_reset += 1
+                        st.rerun()
+                    else:
+                        st.error("Submission failed — check API is running")
+
+            with _rev_col:
+                st.markdown(
+                    '<div style="font-size:0.9rem;font-weight:600;color:#ccc;'
+                    'margin-top:0.5rem;margin-bottom:0.6rem;">Community Reviews</div>',
+                    unsafe_allow_html=True,
+                )
+                reviews = get_reviews(int(rate_id))
+                if reviews:
+                    for rv in reviews:
+                        stars = "★" * round(rv["rating"]) + "☆" * (5 - round(rv["rating"]))
+                        date_str = rv["created_at"][:10] if rv.get("created_at") else ""
+                        review_body = rv.get("review") or ""
+                        display_name = rv.get("username") or f"User {rv['user_id']}"
+                        body_html = (
+                            f'<div style="font-size:0.82rem;color:#aaa;line-height:1.6;">{review_body}</div>'
+                            if review_body else
+                            '<div style="font-size:0.75rem;color:#555;font-style:italic;">No written review</div>'
+                        )
+                        st.markdown(
+                            f'<div style="background:#161616;border:1px solid #222;'
+                            f'border-radius:6px;padding:0.8rem 1rem;margin-bottom:0.5rem;">'
+                            f'<div style="display:flex;justify-content:space-between;'
+                            f'align-items:center;margin-bottom:0.3rem;">'
+                            f'<span style="color:#e8a010;letter-spacing:1px;font-size:0.85rem;">{stars}</span>'
+                            f'<span style="font-size:0.7rem;color:#555;">{display_name} · {date_str}</span>'
+                            f'</div>{body_html}</div>',
+                            unsafe_allow_html=True,
+                        )
+                else:
+                    st.markdown(
+                        '<div style="font-size:0.8rem;color:#555;font-style:italic;margin-top:0.5rem;">'
+                        'No reviews yet — be the first!</div>',
+                        unsafe_allow_html=True,
+                    )
+        else:
+            if not rate_search:
+                st.info("👉 Search for a movie above to get started")
+
+
+
+    # ── ANALYTICS ─────────────────────────────────────────────
+    with tab_analytics:
+        with st.spinner("Loading analytics…"):
+            adata = load_analytics()
+
+        movies_df  = adata.get("movies")
+        users_df   = adata.get("users")
+        rating_dist = adata.get("rating_dist")
+        al_metrics  = adata.get("metrics", {})
+
+        if movies_df is None:
+            st.markdown(
+                '<div class="empty-state"><div class="es-title">No data available</div>'
+                '<div class="es-sub">Run <code>make etl</code> then <code>make train</code></div></div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            # ── Static KPIs (full dataset, no filter yet) ─────────
+            total_all  = int(movies_df["rating_count"].sum())
+            n_users    = len(users_df) if users_df is not None else 162541
+
+            st.markdown('<div class="section-title">Dataset Overview</div>', unsafe_allow_html=True)
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Total Ratings",   f"{total_all:,}")
+            c2.metric("Unique Movies",   f"{len(movies_df):,}")
+            c3.metric("Unique Users",    f"{n_users:,}")
+            c4.metric("Matrix Sparsity", f"{1.0 - total_all/(n_users*len(movies_df)):.2%}")
+
+            # ── Model Performance KPIs ──
+            if al_metrics:
+                st.markdown(
+                    '<div class="section-title" style="margin-top:1.8rem">'
+                    'Model Performance — Spark MLlib ALS</div>',
+                    unsafe_allow_html=True,
+                )
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("RMSE",       f"{al_metrics.get('rmse', 0):.4f}",
+                          help="RMSE on binarised labels (rating ≥ 4.0 = positive)")
+                m2.metric("MAE",        f"{al_metrics.get('mae', 0):.4f}")
+                m3.metric("MAP@10",     f"{al_metrics.get('map_at_10', 0):.4f}",
+                          help="Mean Average Precision at K=10")
+                m4.metric("Train size", f"{int(al_metrics.get('train_size', 0)):,}")
+
+            st.markdown("<hr>", unsafe_allow_html=True)
+
+            # ── Live filters (placed here so charts below react visibly) ──
+            st.markdown('<div class="section-title">Explore the Data</div>', unsafe_allow_html=True)
+            f1, f2, f3 = st.columns(3)
+            with f1:
+                yr_range = st.slider(
+                    "Release year range", 1950, 2019, (1970, 2019),
+                    key="ana_year",
+                    help="Filters the Movies Per Year and Avg Rating by Year charts",
+                )
+            with f2:
+                min_ratings = st.select_slider(
+                    "Min ratings per movie",
+                    options=[5, 20, 50, 100, 500, 1000, 5000, 10000],
+                    value=50,
+                    key="ana_minrat",
+                    help="Raise to focus on popular movies only",
+                )
+            with f3:
+                top_n = st.slider(
+                    "Top N movies", 5, 50, 20, 5,
+                    key="ana_topn",
+                    help="How many movies appear in the Top Movies chart",
+                )
+
+            # Filtered working copy (raw stays cached)
+            filt_df = movies_df[movies_df["rating_count"] >= min_ratings].copy()
+            total_ratings = int(filt_df["rating_count"].sum())
+            n_movies      = len(filt_df)
+            sparsity       = 1.0 - total_ratings / (n_users * n_movies)
+
+            # Quick delta KPIs so the filter effect is immediately obvious
+            d1, d2, d3 = st.columns(3)
+            d1.metric("Movies matching filter", f"{n_movies:,}",
+                      delta=f"{n_movies - len(movies_df):,}", delta_color="off")
+            d2.metric("Ratings in filtered set", f"{total_ratings:,}")
+            d3.metric("Filtered sparsity",       f"{sparsity:.2%}")
+
+            st.markdown("<hr>", unsafe_allow_html=True)
+
+            # Precompute year_df
+            year_df = (
+                filt_df[
+                    (filt_df["year"] >= yr_range[0]) & (filt_df["year"] <= yr_range[1])
+                ]
+                .groupby("year")
+                .agg(movie_count=("movie_id", "count"), avg_rating=("avg_rating", "mean"))
+                .reset_index()
+            )
+
+            # ── Row 1: Avg Rating by Year + Genre Pie ──
+            col_r1a, col_r1b = st.columns(2)
+
+            with col_r1a:
+                fig8 = px.scatter(
+                    year_df, x="year", y="avg_rating",
+                    title=f"Avg Rating by Year ({yr_range[0]}–{yr_range[1]})",
+                    labels={"year": "Release Year", "avg_rating": "Avg Rating"},
+                    color_discrete_sequence=["#e50914"],
+                    trendline="lowess",
+                    trendline_color_override="#888",
+                )
+                fig8.update_layout(**_PLOT_BASE, title_font_color="#e8e8e8")
+                st.plotly_chart(fig8, use_container_width=True)
+                st.markdown(
+                    '<div style="font-size:0.75rem;color:#555;margin-top:-0.8rem;padding-bottom:0.5rem">'
+                    'Insight: Older films (pre-1980) receive higher average ratings — '
+                    'survivorship bias: only highly regarded classics from that era remain in the catalog.'
+                    '</div>', unsafe_allow_html=True
+                )
+
+            with col_r1b:
+                _gstats_pie = _genre_stats(filt_df)
+                _pie_top9   = _gstats_pie.head(9)
+                _pie_other  = int(_gstats_pie["movie_count"].iloc[9:].sum())
+                _pie_df = pd.concat([
+                    _pie_top9[["genre", "movie_count"]].rename(columns={"movie_count": "count"}),
+                    pd.DataFrame([{"genre": "Other", "count": _pie_other}]),
+                ], ignore_index=True)
+                fig_pie = px.pie(
+                    _pie_df, values="count", names="genre",
+                    title=f"Movies by Genre (min {min_ratings:,} ratings/movie)",
+                    hole=0.38,
+                    color_discrete_sequence=[
+                        "#e50914","#c5000f","#a00010","#800020",
+                        "#ff4444","#ff7777","#ffaaaa","#cc3333","#992222","#444",
+                    ],
+                )
+                _pb_pie = {k: v for k, v in _PLOT_BASE.items() if k not in ("xaxis", "yaxis")}
+                fig_pie.update_layout(
+                    **_pb_pie,
+                    title_font_color="#e8e8e8",
+                    showlegend=True,
+                    legend=dict(font=dict(color="#888", size=9)),
+                )
+                fig_pie.update_traces(
+                    textposition="inside", textinfo="percent",
+                    textfont=dict(size=9, color="#fff"),
+                    marker=dict(line=dict(color="#111111", width=1)),
+                )
+                st.plotly_chart(fig_pie, use_container_width=True)
+
+            # ── Row 2: User activity + Rating longtail ──
+            col_l3, col_r3 = st.columns(2)
+
+            with col_l3:
+                if users_df is not None:
+                    buckets = pd.cut(
+                        users_df["rating_count"],
+                        bins=[0, 50, 100, 250, 500, 1000, 5000, 50000],
+                        labels=["1–50", "51–100", "101–250", "251–500", "501–1K", "1K–5K", "5K+"],
+                    )
+                    bucket_counts = buckets.value_counts().sort_index().reset_index()
+                    bucket_counts.columns = ["ratings_given", "users"]
+                    bucket_counts["pct"] = (bucket_counts["users"] / bucket_counts["users"].sum() * 100).round(1)
+
+                    fig5 = px.bar(
+                        bucket_counts, x="ratings_given", y="users",
+                        title="User Activity Distribution",
+                        labels={"ratings_given": "Ratings Given", "users": "Number of Users"},
+                        color_discrete_sequence=["#e50914"],
+                        text=bucket_counts["pct"].astype(str) + "%",
+                    )
+                    fig5.update_layout(**_PLOT_BASE, title_font_color="#e8e8e8")
+                    fig5.update_traces(marker_line_width=0, textposition="outside",
+                                       textfont=dict(color="#666", size=10))
+                    st.plotly_chart(fig5, use_container_width=True)
+                    st.markdown(
+                        '<div style="font-size:0.75rem;color:#555;margin-top:-0.8rem;padding-bottom:0.5rem">'
+                        'Insight: Most users rate fewer than 100 movies — sparse interactions '
+                        'make collaborative filtering challenging without the ALS latent-factor approach.'
+                        '</div>', unsafe_allow_html=True
+                    )
+
+            with col_r3:
+                longtail = (
+                    filt_df[["movie_id", "title", "rating_count"]]
+                    .sort_values("rating_count", ascending=False)
+                    .reset_index(drop=True)
+                )
+                longtail["rank"] = longtail.index + 1
+                longtail["cumulative_pct"] = (longtail["rating_count"].cumsum() / longtail["rating_count"].sum() * 100)
+
+                top10_pct = longtail[longtail["rank"] <= int(len(longtail) * 0.1)]["cumulative_pct"].iloc[-1]
+
+                fig6 = px.line(
+                    longtail[longtail["rank"] <= min(5000, len(longtail))],
+                    x="rank", y="rating_count",
+                    title="The Long-Tail Problem: Movie Popularity Distribution",
+                    labels={"rank": "Movie Rank (by popularity)", "rating_count": "Number of Ratings"},
+                    color_discrete_sequence=["#e50914"],
+                )
+                fig6.update_layout(**_PLOT_BASE, title_font_color="#e8e8e8")
+                fig6.add_vline(x=int(len(longtail) * 0.1), line_dash="dash",
+                               line_color="#555", annotation_text="Top 10%",
+                               annotation_font_color="#666")
+                st.plotly_chart(fig6, use_container_width=True)
+                st.markdown(
+                    f'<div style="font-size:0.75rem;color:#555;margin-top:-0.8rem;padding-bottom:0.5rem">'
+                    f'Insight: The top 10% of movies account for {top10_pct:.0f}% of all ratings. '
+                    f'ALS collaborative filtering is essential to surface quality films in the long tail.'
+                    f'</div>', unsafe_allow_html=True
+                )
+
+            # ── Row 3: Movies Per Year (full-width) ──
+            fig7 = px.area(
+                year_df, x="year", y="movie_count",
+                title=f"Movies Per Year ({yr_range[0]}–{yr_range[1]})",
+                labels={"year": "Release Year", "movie_count": "Movies"},
+                color_discrete_sequence=["#e50914"],
+            )
+            fig7.update_layout(**_PLOT_BASE, title_font_color="#e8e8e8")
+            fig7.update_traces(fillcolor="rgba(229,9,20,0.15)", line_color="#e50914")
+            st.plotly_chart(fig7, use_container_width=True)
+
+            st.markdown("<hr>", unsafe_allow_html=True)
+
+            # ── Row 3: Rating distribution + Genre popularity ──
+            col_l, col_r = st.columns(2)
+
+            with col_l:
+                if rating_dist is not None:
+                    fig = px.bar(
+                        rating_dist, x="rating", y="count",
+                        title="Rating Distribution (25M ratings)",
+                        labels={"rating": "Star Rating", "count": "Number of Ratings"},
+                        color_discrete_sequence=["#e50914"],
+                    )
+                    fig.update_layout(**_PLOT_BASE, title_font_color="#e8e8e8")
+                    fig.update_traces(marker_line_width=0)
+                    fig.add_annotation(
+                        text="4.0★ is the most common rating — users preferentially watch movies they expect to like",
+                        xref="paper", yref="paper", x=0.5, y=1.0,
+                        showarrow=False, font=dict(size=9, color="#666"),
+                        xanchor="center", yanchor="bottom",
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+            with col_r:
+                gstats = _genre_stats(filt_df).head(15)
+                fig2 = px.bar(
+                    gstats.sort_values("total_ratings"),
+                    x="total_ratings", y="genre",
+                    orientation="h",
+                    title=f"Total Ratings by Genre (min {min_ratings:,} ratings/movie)",
+                    labels={"total_ratings": "Ratings", "genre": ""},
+                    color_discrete_sequence=["#e50914"],
+                )
+                fig2.update_layout(**_PLOT_BASE, title_font_color="#e8e8e8")
+                fig2.update_traces(marker_line_width=0)
+                st.plotly_chart(fig2, use_container_width=True)
+
+            # ── Row 4: Genre avg rating (bias) + Top movies ──
+            col_l2, col_r2 = st.columns(2)
+
+            with col_l2:
+                gstats_full = _genre_stats(filt_df)
+                gstats_full = gstats_full[gstats_full["movie_count"] >= 10].copy()
+                gstats_full = gstats_full.sort_values("avg_rating", ascending=True).tail(18)
+                colors = ["#e50914" if r >= 3.3 else "#555" for r in gstats_full["avg_rating"]]
+                fig3 = go.Figure(go.Bar(
+                    x=gstats_full["avg_rating"],
+                    y=gstats_full["genre"],
+                    orientation="h",
+                    marker_color=colors,
+                    marker_line_width=0,
+                    text=gstats_full["avg_rating"].round(2),
+                    textposition="outside",
+                    textfont=dict(color="#888", size=10),
+                ))
+                _pb = {k: v for k, v in _PLOT_BASE.items() if k not in ("xaxis", "yaxis")}
+                fig3.update_layout(
+                    **_pb,
+                    title="Average Rating by Genre",
+                    title_font_color="#e8e8e8",
+                    xaxis=dict(range=[2.5, 3.7], gridcolor="#1e1e1e", zerolinecolor="#1e1e1e"),
+                    yaxis=dict(gridcolor="#1e1e1e", zerolinecolor="#1e1e1e"),
+                )
+                st.plotly_chart(fig3, use_container_width=True)
+                st.markdown(
+                    '<div style="font-size:0.75rem;color:#555;margin-top:-0.8rem;padding-bottom:0.5rem">'
+                    'Insight: Documentary, History, and War films earn systematically higher ratings. '
+                    'Horror and Sci-Fi lag — genre expectations shape how users rate.'
+                    '</div>', unsafe_allow_html=True
+                )
+
+            with col_r2:
+                top_movies = (
+                    filt_df
+                    .sort_values("rating_count", ascending=False)
+                    .head(top_n)
+                    .sort_values("rating_count")
+                )
+                fig4 = px.bar(
+                    top_movies, x="rating_count", y="title",
+                    orientation="h",
+                    title=f"Top {top_n} Most-Rated Movies (min {min_ratings:,} ratings)",
+                    labels={"rating_count": "Ratings", "title": ""},
+                    color_discrete_sequence=["#c5000f"],
+                )
+                fig4.update_layout(**_PLOT_BASE, title_font_color="#e8e8e8",
+                                   height=max(340, top_n * 22))
+                fig4.update_traces(marker_line_width=0)
+                st.plotly_chart(fig4, use_container_width=True)
